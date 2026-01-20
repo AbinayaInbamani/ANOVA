@@ -1,5 +1,3 @@
-
-
 import io
 import numpy as np
 import pandas as pd
@@ -14,84 +12,86 @@ from statsmodels.stats.anova import anova_lm
 REQUIRED = ["Variety", "Trait", "Treatment", "Rep", "Value"]
 
 # -----------------------------
-# Data loading (handles your Excel)
+# Formatting helpers
 # -----------------------------
-def load_excel_safely(uploaded_file: io.BytesIO) -> pd.DataFrame:
-    # First try normal header read
-    df = pd.read_excel(uploaded_file)
+def fmt2(x):
+    if pd.isna(x):
+        return ""
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
 
-    # Drop columns that are completely empty
+def fmt_p(x):
+    if pd.isna(x):
+        return ""
+    try:
+        x = float(x)
+        # show scientific for very small p
+        if x < 0.001:
+            return f"{x:.2e}"
+        return f"{x:.4f}"
+    except Exception:
+        return str(x)
+
+# -----------------------------
+# Data loading
+# -----------------------------
+def load_excel_safely(uploaded_file) -> pd.DataFrame:
+    df = pd.read_excel(uploaded_file)
     df = df.dropna(axis=1, how="all")
 
-    # If still has extra columns like "Unnamed:*", keep only first 5 columns
-    # (your file: Variety, Trait, Treatment, Rep, Value are first five)
+    # if extra empty columns exist, keep first 5 columns (your format)
     if df.shape[1] > 5:
         df = df.iloc[:, :5]
 
-    # If header is missing, pandas will create integer columns [0..4]
-    # Detect this and assign headers
-    if list(df.columns) == [0, 1, 2, 3, 4] or all(isinstance(c, int) for c in df.columns):
+    # if header missing, pandas may use 0..4
+    if all(isinstance(c, int) for c in df.columns) and df.shape[1] == 5:
         df.columns = REQUIRED
 
-    # Standardize column names (strip whitespace)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # If the first row is actually the header text (common when header=None was used upstream),
-    # detect and fix:
+    # if first row contains header words, fix
     if df.shape[0] > 0:
         first_row = df.iloc[0].astype(str).str.strip().tolist()
         if set(first_row) >= set(REQUIRED):
             df.columns = first_row[:5]
             df = df.iloc[1:].reset_index(drop=True)
 
-    # Keep only required columns (ignore extras if present)
-    df = df[[c for c in REQUIRED if c in df.columns]]
+    # keep required columns
+    df = df[[c for c in REQUIRED if c in df.columns]].copy()
 
-    # Clean text columns
+    # clean strings
     for c in ["Variety", "Trait", "Treatment", "Rep"]:
         df[c] = df[c].astype(str).str.strip()
 
-    # Numeric Value
     df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
-
-    # Drop missing
     df = df.dropna(subset=REQUIRED).reset_index(drop=True)
 
     return df
-
 
 def validate_df(df: pd.DataFrame):
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
         return False, f"Missing columns: {missing}. Required: {REQUIRED}"
-
-    if df["Trait"].nunique() == 0:
-        return False, "No Trait values found."
-
-    if df["Treatment"].nunique() == 0 or df["Rep"].nunique() == 0:
-        return False, "Treatment/Rep columns look empty."
-
+    if df["Variety"].nunique() < 1:
+        return False, "No varieties found."
+    if df["Trait"].nunique() < 1:
+        return False, "No traits found."
     return True, "OK"
 
-
 # -----------------------------
-# ANOVA + Statement
+# ANOVA
 # -----------------------------
 def run_anova(df_trait: pd.DataFrame):
-    """
-    If >=2 varieties: Value ~ Variety*Treatment + Rep
-    If 1 variety:     Value ~ Treatment + Rep
-    """
     n_var = df_trait["Variety"].nunique()
     if n_var >= 2:
         formula = "Value ~ C(Variety) * C(Treatment) + C(Rep)"
     else:
         formula = "Value ~ C(Treatment) + C(Rep)"
-
     model = ols(formula, data=df_trait).fit()
     aov = anova_lm(model, typ=2)
     return formula, model, aov
-
 
 def get_aov(aov, row, col, default=np.nan):
     if row in aov.index and col in aov.columns:
@@ -101,53 +101,45 @@ def get_aov(aov, row, col, default=np.nan):
             return default
     return default
 
-
 def nine_values_and_conclusion(df_trait, aov, trait_name, alpha=0.05):
     n_var = df_trait["Variety"].nunique()
-
     N = int(df_trait.shape[0])
     grand_mean = float(df_trait["Value"].mean())
 
+    # If only one variety: no “better variety”
     if n_var < 2:
-        # No variety comparison possible
-        best_t = df_trait.groupby("Treatment")["Value"].mean().sort_values(ascending=False).index[0]
-        return (
-            pd.DataFrame(
-                [
-                    ("N (observations)", N),
-                    ("Grand Mean", grand_mean),
-                    ("Note", "Only one variety present → no variety comparison possible."),
-                ],
-                columns=["Metric", "Value"],
-            ),
-            f"Only one variety found. For {trait_name}, the best mean treatment is {best_t}.",
+        # best treatment within this one variety
+        best_t = (
+            df_trait.groupby("Treatment")["Value"].mean()
+            .sort_values(ascending=False).index[0]
         )
+        nine = pd.DataFrame(
+            [
+                ("N (observations)", N),
+                ("Grand Mean", grand_mean),
+                ("Note", "Only one variety present → cannot compare varieties."),
+            ],
+            columns=["Metric", "Value"]
+        )
+        conclusion = (
+            f"Only one variety found in the uploaded file. "
+            f"For {trait_name}, the best mean treatment is {best_t} for this variety."
+        )
+        return nine, conclusion
 
+    # Means by variety
     means = df_trait.groupby("Variety")["Value"].mean().sort_values(ascending=False)
     best = means.index[0]
     other = means.index[1]
 
-    # Variety row
-    row_var = "C(Variety)"
-    SS = get_aov(aov, row_var, "sum_sq")
-    dfv = get_aov(aov, row_var, "df")
+    # ANOVA pieces
+    SS = get_aov(aov, "C(Variety)", "sum_sq")
+    dfv = get_aov(aov, "C(Variety)", "df")
     MS = SS / dfv if (not np.isnan(SS) and not np.isnan(dfv) and dfv != 0) else np.nan
-    F = get_aov(aov, row_var, "F")
-    p = get_aov(aov, row_var, "PR(>F)")
+    F = get_aov(aov, "C(Variety)", "F")
+    p = get_aov(aov, "C(Variety)", "PR(>F)")
 
-    # Interaction
-    row_int = "C(Variety):C(Treatment)"
-    p_int = get_aov(aov, row_int, "PR(>F)")
-
-    if not np.isnan(p_int) and p_int < alpha:
-        conclusion = (
-            f"Variety performance for {trait_name} depended on treatment "
-            f"(Variety × Treatment interaction p < {alpha})."
-        )
-    elif not np.isnan(p) and p < alpha:
-        conclusion = f"{best} performed significantly better than {other} for {trait_name} (p < {alpha})."
-    else:
-        conclusion = f"There was no statistically significant difference between {best} and {other} for {trait_name} (p ≥ {alpha})."
+    p_int = get_aov(aov, "C(Variety):C(Treatment)", "PR(>F)")
 
     nine = pd.DataFrame(
         [
@@ -161,10 +153,27 @@ def nine_values_and_conclusion(df_trait, aov, trait_name, alpha=0.05):
             ("F(Variety)", F),
             ("p-value(Variety)", p),
         ],
-        columns=["Metric", "Value"],
+        columns=["Metric", "Value"]
     )
-    return nine, conclusion
 
+    # Clear conclusion
+    if not np.isnan(p_int) and p_int < alpha:
+        conclusion = (
+            f"Better variety depends on treatment for {trait_name} "
+            f"(Variety × Treatment interaction p = {fmt_p(p_int)})."
+        )
+    elif not np.isnan(p) and p < alpha:
+        conclusion = (
+            f"{best} is better than {other} for {trait_name} "
+            f"(p = {fmt_p(p)} < {alpha})."
+        )
+    else:
+        conclusion = (
+            f"No significant difference between {best} and {other} for {trait_name} "
+            f"(p = {fmt_p(p)} ≥ {alpha})."
+        )
+
+    return nine, conclusion
 
 # -----------------------------
 # Plots
@@ -191,8 +200,13 @@ def plot_ci95_by_variety(df_trait, ylabel):
     ax.grid(False)
     st.pyplot(fig, clear_figure=True)
 
+def qq_plot_only(model, ylabel):
+    fig = plt.figure()
+    sm.qqplot(model.resid, line="45", fit=True)
+    plt.title(f"Q-Q Plot: {ylabel}")
+    st.pyplot(fig, clear_figure=True)
 
-def plot_interaction(df_trait, ylabel):
+def interaction_plot(df_trait, ylabel):
     pivot = df_trait.pivot_table(index="Treatment", columns="Variety", values="Value", aggfunc="mean")
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for v in pivot.columns:
@@ -204,8 +218,7 @@ def plot_interaction(df_trait, ylabel):
     ax.grid(True, linestyle="--", linewidth=0.5)
     st.pyplot(fig, clear_figure=True)
 
-
-def plot_box(df_trait, ylabel):
+def boxplot(df_trait, ylabel):
     fig, ax = plt.subplots(figsize=(10, 5))
     df_trait.boxplot(column="Value", by=["Treatment", "Variety"], grid=False, ax=ax)
     ax.set_title(f"Boxplot: {ylabel} by Treatment × Variety")
@@ -213,30 +226,16 @@ def plot_box(df_trait, ylabel):
     ax.set_ylabel(ylabel)
     st.pyplot(fig, clear_figure=True)
 
-
-def plot_residuals(model, ylabel):
-    fig1, ax1 = plt.subplots(figsize=(6, 4))
-    ax1.scatter(model.fittedvalues, model.resid)
-    ax1.axhline(0, linestyle="--")
-    ax1.set_title(f"Residuals vs Fitted: {ylabel}")
-    ax1.set_xlabel("Fitted")
-    ax1.set_ylabel("Residuals")
-    ax1.grid(True, linestyle="--", linewidth=0.5)
-    st.pyplot(fig1, clear_figure=True)
-
-    fig2 = plt.figure()
-    sm.qqplot(model.resid, line="45", fit=True)
-    plt.title(f"Q-Q Plot: {ylabel}")
-    st.pyplot(fig2, clear_figure=True)
-
-
 # -----------------------------
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="ANOVA App", layout="wide")
 st.title("ANOVA App (Variety / Trait / Treatment / Rep / Value)")
 
-uploaded = st.file_uploader("Upload Excel (.xlsx) with 5 columns: Variety, Trait, Treatment, Rep, Value", type=["xlsx"])
+uploaded = st.file_uploader(
+    "Upload Excel (.xlsx) with 5 columns: Variety, Trait, Treatment, Rep, Value (header optional)",
+    type=["xlsx"]
+)
 if not uploaded:
     st.info("Upload your Excel file to continue.")
     st.stop()
@@ -251,76 +250,61 @@ if not ok:
 st.subheader("Data preview")
 st.dataframe(df.head(30), use_container_width=True)
 
-# Trait selection
 traits = sorted(df["Trait"].unique().tolist())
 trait = st.selectbox("Select Trait", traits)
 
 df_trait = df[df["Trait"].str.lower() == trait.lower()].copy()
-df_trait["Variety"] = df_trait["Variety"].astype(str)
-df_trait["Treatment"] = df_trait["Treatment"].astype(str)
-df_trait["Rep"] = df_trait["Rep"].astype(str)
 
 st.markdown("### Data checks")
 st.write("Varieties:", sorted(df_trait["Variety"].unique().tolist()))
 st.write("Treatments:", sorted(df_trait["Treatment"].unique().tolist()))
 st.write("Reps:", sorted(df_trait["Rep"].unique().tolist()))
+st.dataframe(df_trait.groupby(["Variety","Treatment"]).size().unstack(fill_value=0), use_container_width=True)
 
-st.write("Counts per Variety × Treatment (should be equal if balanced):")
-st.dataframe(df_trait.groupby(["Variety", "Treatment"]).size().unstack(fill_value=0))
-
-# ANOVA
 st.markdown("## ANOVA")
 formula, model, aov = run_anova(df_trait)
+
 st.caption(f"Model: `{formula}`")
+st.markdown(
+    "**What does `C()` mean?**  \n"
+    "`C(Variety)` tells the ANOVA model to treat *Variety* as a **categorical factor** (group labels), "
+    "so it compares **group means** instead of fitting a numeric trend."
+)
+
 st.dataframe(aov, use_container_width=True)
 
-# 9 values + conclusion
 nine_df, conclusion = nine_values_and_conclusion(df_trait, aov, trait, alpha=0.05)
 
-st.markdown("## 9 Output Values (Variety effect) + Conclusion")
-st.dataframe(nine_df, use_container_width=True)
+# Format the 9 outputs: 2 decimals for most, scientific for p-values
+nine_show = nine_df.copy()
+nine_show["Value"] = nine_show.apply(
+    lambda r: fmt_p(r["Value"]) if "p-value" in str(r["Metric"]).lower() else fmt2(r["Value"]),
+    axis=1
+)
+
+st.markdown("## 9 Output Values + Conclusion")
+st.dataframe(nine_show, use_container_width=True)
 st.success(conclusion)
 
-# Plots
 st.markdown("## Plots")
-
-col1, col2 = st.columns(2)
-with col1:
-    if df_trait["Variety"].nunique() >= 2:
-        st.write("95% CI Error Bar Plot (by Variety)")
-        plot_ci95_by_variety(df_trait, ylabel=trait)
-    else:
-        st.info("Only one variety present → CI-by-variety plot not available.")
-
-with col2:
-    if df_trait["Variety"].nunique() >= 2:
-        st.write("Interaction Plot (Treatment means per Variety)")
-        plot_interaction(df_trait, ylabel=trait)
-    else:
-        st.info("Only one variety present → interaction plot not available.")
-
-st.write("Boxplot")
 if df_trait["Variety"].nunique() >= 2:
-    plot_box(df_trait, ylabel=trait)
+    plot_ci95_by_variety(df_trait, ylabel=trait)
+    interaction_plot(df_trait, ylabel=trait)
+    boxplot(df_trait, ylabel=trait)
 else:
-    # If one variety, simpler boxplot by treatment only
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    df_trait.boxplot(column="Value", by="Treatment", grid=False, ax=ax)
-    ax.set_title(f"Boxplot: {trait} by Treatment")
-    plt.suptitle("")
-    ax.set_ylabel(trait)
-    st.pyplot(fig, clear_figure=True)
+    st.info("Only one variety present: CI-by-variety and interaction plot not available.")
 
-st.write("Residual Diagnostics")
-plot_residuals(model, ylabel=trait)
+st.markdown("## Diagnostics")
+st.write("Q–Q Plot (normality check)")
+qq_plot_only(model, ylabel=trait)
 
-# Download output (ANOVA + summary) as Excel
+# Download output
 st.markdown("## Download Output")
 out = io.BytesIO()
 with pd.ExcelWriter(out, engine="openpyxl") as writer:
     df_trait.to_excel(writer, index=False, sheet_name="Filtered_Data")
     aov.to_excel(writer, sheet_name="ANOVA_Table")
-    nine_df.to_excel(writer, index=False, sheet_name="Variety_9_Values")
+    nine_show.to_excel(writer, index=False, sheet_name="Nine_Values_Formatted")
     pd.DataFrame({"Conclusion": [conclusion]}).to_excel(writer, index=False, sheet_name="Conclusion")
 
 st.download_button(
